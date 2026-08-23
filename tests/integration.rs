@@ -25,7 +25,7 @@ fn real_sample_extracts_ink_and_builds_valid_rnote_structure() {
         format: FormatKind::A4,
         ..Default::default()
     };
-    let prepared = prepare_strokes(&pages, &options);
+    let prepared = prepare_strokes(&pages, &options).expect("prepare");
     let bytes = onenote2rnote::rnote::build_rnote_bytes(&prepared, &options).expect("build");
 
     let mut json = String::new();
@@ -121,7 +121,7 @@ fn empty_input_errors() {
     }
     let pages = onedata::parse_input(&sample).expect("parse section");
     let options = Options::default();
-    let prepared = prepare_strokes(&pages, &options);
+    let prepared = prepare_strokes(&pages, &options).expect("prepare");
     let result = onenote2rnote::rnote::build_rnote_bytes(&prepared, &options);
     assert!(result.is_err(), "expected error when no ink is present");
 }

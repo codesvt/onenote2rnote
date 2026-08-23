@@ -1,4 +1,4 @@
-use crate::onedata::InkStrokeData;
+use crate::onedata::{InkStrokeData, MediaData, MediaKind, PageData};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::{Value, json};
@@ -28,6 +28,9 @@ pub struct Options {
     pub margin_px: f64,
     pub background: BackgroundKind,
     pub normalize: bool,
+    /// Place content exactly at its original OneNote coordinates (no margins / re-alignment).
+    /// Mutually exclusive with `normalize`; when `true`, `normalize` is ignored.
+    pub original_pos: bool,
 }
 
 impl Default for Options {
@@ -38,13 +41,14 @@ impl Default for Options {
             format: FormatKind::Source,
             min_page_height_mm: None,
             margin_px: 48.0,
-            background: BackgroundKind::Lines,
+            background: BackgroundKind::Grid,
             normalize: true,
+            original_pos: false,
         }
     }
 }
 
-/// A stroke prepared for output: points already in px, absolute within the doc.
+/// A stroke prepared for output: points already in px, absolute within the page.
 #[derive(Debug, Clone)]
 pub struct OutStroke {
     pub points: Vec<(f64, f64)>,
@@ -53,13 +57,37 @@ pub struct OutStroke {
     pub highlighter: bool,
 }
 
+/// A bitmap (image or rendered PDF page) prepared for output.
+#[derive(Debug, Clone)]
+pub struct OutImage {
+    /// Top-left position in px, page-local.
+    pub x: f64,
+    /// Top-left position in px, page-local.
+    pub y: f64,
+    /// Display width in px.
+    pub width: f64,
+    /// Display height in px.
+    pub height: f64,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// Raw RGBA8-premultiplied pixel data (`4 * pixel_width * pixel_height` bytes).
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedPage {
     pub strokes: Vec<OutStroke>,
+    pub images: Vec<OutImage>,
     pub height_half_inch: Option<f64>,
+    pub guid: Option<String>,
+    pub title: Option<String>,
 }
 
 impl PreparedPage {
+    pub fn has_content(&self) -> bool {
+        !self.strokes.is_empty() || !self.images.is_empty()
+    }
+
     pub fn has_ink(&self) -> bool {
         !self.strokes.is_empty()
     }
@@ -106,48 +134,155 @@ fn stroke_json(stroke: &OutStroke) -> Value {
     })
 }
 
+/// A `Rectangle` (parry Cuboid + glamx DAffine2) placed at `(x, y)` with the given extents.
+/// `affine` is the flat 6-element column-major array `[x_axis.x, x_axis.y, y_axis.x, y_axis.y, z_axis.x, z_axis.y]`.
+fn rectangle_json(half_w: f64, half_h: f64, cx: f64, cy: f64) -> Value {
+    json!({
+        "cuboid": {"half_extents": [dp3(half_w), dp3(half_h)]},
+        "affine": [1.0, 0.0, 0.0, 1.0, dp3(cx), dp3(cy)]
+    })
+}
+
+fn image_json(image: &OutImage) -> Value {
+    // Display rectangle spans `x..x+width` x `y..y+height` (center = x+w/2, y+h/2).
+    let display = rectangle_json(
+        image.width * 0.5,
+        image.height * 0.5,
+        image.x + image.width * 0.5,
+        image.y + image.height * 0.5,
+    );
+    // The embedded image's own rectangle spans 0..pixel_width x 0..pixel_height.
+    let image_rect = rectangle_json(
+        image.pixel_width as f64 * 0.5,
+        image.pixel_height as f64 * 0.5,
+        image.pixel_width as f64 * 0.5,
+        image.pixel_height as f64 * 0.5,
+    );
+
+    json!({
+        "bitmapimage": {
+            "image": {
+                "data": base64_encode(&image.data),
+                "rectangle": image_rect,
+                "pixel_width": image.pixel_width,
+                "pixel_height": image.pixel_height,
+                "memory_format": "R8g8b8a8Premultiplied"
+            },
+            "rectangle": display
+        }
+    })
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode an encoded image (PNG/JPEG) into raw RGBA8-premultiplied pixels.
+fn decode_to_premul_rgba(encoded: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(encoded)
+        .map_err(|e| anyhow::anyhow!("decoding image failed: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for px in rgba.pixels() {
+        let (r, g, b, a) = (px.0[0], px.0[1], px.0[2], px.0[3]);
+        // Premultiply: Rnote stores R8g8b8a8Premultiplied.
+        data.extend_from_slice(&[
+            (r as u16 * a as u16 / 255) as u8,
+            (g as u16 * a as u16 / 255) as u8,
+            (b as u16 * a as u16 / 255) as u8,
+            a,
+        ]);
+    }
+    Ok((data, w, h))
+}
+
+/// Convert a media item into an output image. `Pdf` items are rendered via `pdftoppm`.
+fn convert_media(media: &MediaData, dpi: f64) -> anyhow::Result<Option<OutImage>> {
+    let scale = dpi / 2.0; // half-inch -> px
+    let x = media.x_half_inch * scale;
+    let y = media.y_half_inch * scale;
+
+    let (data, pixel_width, pixel_height) = match media.kind {
+        MediaKind::Image => decode_to_premul_rgba(&media.bytes)?,
+        MediaKind::Pdf => {
+            let page_index = media.page_index.unwrap_or(0);
+            let png = crate::pdf::render_pdf_page(&media.bytes, page_index, dpi as u32)?;
+            decode_to_premul_rgba(&png)?
+        }
+        MediaKind::Other => return Ok(None),
+    };
+
+    let mut width = media.width_half_inch * scale;
+    let mut height = media.height_half_inch * scale;
+    if width <= 0.0 || height <= 0.0 {
+        width = pixel_width as f64;
+        height = pixel_height as f64;
+    }
+
+    Ok(Some(OutImage {
+        x,
+        y,
+        width,
+        height,
+        pixel_width,
+        pixel_height,
+        data,
+    }))
+}
+
 pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::Result<Vec<u8>> {
-    let nonempty: Vec<&PreparedPage> = pages.iter().filter(|p| p.has_ink()).collect();
+    let nonempty: Vec<&PreparedPage> = pages.iter().filter(|p| p.has_content()).collect();
 
     if nonempty.is_empty() {
-        anyhow::bail!("no handwritten ink found in the input files");
+        anyhow::bail!("no handwritten ink or media found in the input files");
     }
 
-    let mm_to_px = |mm: f64| mm / 25.4 * options.dpi;
+    let (page_w_px, page_h_px) = compute_page_size(&nonempty, options);
 
-    // Geometry per page: bounding boxes (in px, already page-local).
-    let mut content_w: f64 = 0.0;
-    let mut content_h: f64 = 0.0;
-    for page in &nonempty {
-        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for s in page.strokes.iter() {
-            let hw = s.width_px * 0.5;
-            for (x, y) in s.points.iter() {
-                min_x = min_x.min(x - hw);
-                min_y = min_y.min(y - hw);
-                max_x = max_x.max(x + hw);
-                max_y = max_y.max(y + hw);
-            }
-        }
-        if max_x > min_x && max_y > min_y {
-            content_w = content_w.max(max_x - min_x);
-            content_h = content_h.max(max_y - min_y);
-        }
-    }
+    // Re-position content onto the page grid.
+    let offsets: Vec<(f64, f64)> = if options.original_pos {
+        nonempty.iter().map(|_| (0.0, 0.0)).collect()
+    } else {
+        nonempty
+            .iter()
+            .enumerate()
+            .map(|(idx, page)| page_offset(idx, page, page_h_px, options))
+            .collect()
+    };
 
-    let (page_w_mm, mut page_h_mm): (f64, f64) = match options.format {
+    build_document(&nonempty, &offsets, page_w_px, page_h_px, options)
+}
+
+/// Build a single-page `.rnote` document for one page (used by `--out-dir`).
+/// Content is kept at its original position.
+pub fn build_rnote_bytes_single(page: &PreparedPage, options: &Options) -> anyhow::Result<Vec<u8>> {
+    let (page_w_px, page_h_px) = compute_single_page_size(page, options);
+    let pages = std::slice::from_ref(&page);
+    let offsets = vec![(0.0, 0.0)];
+    build_document(pages, &offsets, page_w_px, page_h_px, options)
+}
+
+/// Page geometry in millimetres, from the configured format.
+fn page_size_mm(options: &Options) -> (f64, f64) {
+    match options.format {
         FormatKind::A4 => (210.0, 297.0),
         FormatKind::UsLetter => (215.9, 279.4),
         FormatKind::Source => (210.0, 297.0),
-    };
+    }
+}
+
+/// The page is always the configured size (A4 by default). Content is not fitted or stretched.
+fn compute_page_size(nonempty: &[&PreparedPage], options: &Options) -> (f64, f64) {
+    let (page_w_mm, mut page_h_mm) = page_size_mm(options);
 
     if options.format == FormatKind::Source {
-        // honour the OneNote page height when available
-        for page in pages.iter() {
+        // Honour the OneNote page height when available.
+        for page in nonempty.iter() {
             if let Some(half_inch) = page.height_half_inch {
                 let h_mm = half_inch * 0.5 * 25.4;
-                if h_mm >= 60.0 && h_mm <= 1500.0 {
+                if (60.0..=1500.0).contains(&h_mm) {
                     page_h_mm = page_h_mm.max(h_mm);
                 }
             }
@@ -157,42 +292,60 @@ pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::R
         page_h_mm = page_h_mm.max(min_mm);
     }
 
-    let mut page_w_px = mm_to_px(page_w_mm).max(content_w + 2.0 * options.margin_px);
-    let mut page_h_px = mm_to_px(page_h_mm).max(content_h + 2.0 * options.margin_px);
+    let mm_to_px = |mm: f64| mm / 25.4 * options.dpi;
+    let page_w_px = mm_to_px(page_w_mm).max(60.0);
+    let page_h_px = mm_to_px(page_h_mm).max(60.0);
+    (page_w_px, page_h_px)
+}
 
-    if page_h_px < 60.0 {
-        page_h_px = 60.0;
+fn compute_single_page_size(page: &PreparedPage, options: &Options) -> (f64, f64) {
+    let one = [page];
+    compute_page_size(&one, options)
+}
+
+fn page_offset(
+    page_idx: usize,
+    page: &PreparedPage,
+    page_h_px: f64,
+    options: &Options,
+) -> (f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    for s in page.strokes.iter() {
+        let hw = s.width_px * 0.5;
+        for (x, y) in s.points.iter() {
+            min_x = min_x.min(x - hw);
+            min_y = min_y.min(y - hw);
+        }
     }
-    if page_w_px < 60.0 {
-        page_w_px = 60.0;
+    for img in page.images.iter() {
+        min_x = min_x.min(img.x);
+        min_y = min_y.min(img.y);
     }
 
-    // Re-position strokes onto the final page grid.
-    let n_pages = nonempty.len();
+    if !min_x.is_finite() {
+        (0.0, page_idx as f64 * page_h_px)
+    } else if options.normalize {
+        (
+            options.margin_px - min_x,
+            page_idx as f64 * page_h_px + options.margin_px - min_y,
+        )
+    } else {
+        (0.0, page_idx as f64 * page_h_px)
+    }
+}
+
+fn build_document(
+    pages: &[&PreparedPage],
+    offsets: &[(f64, f64)],
+    page_w_px: f64,
+    page_h_px: f64,
+    options: &Options,
+) -> anyhow::Result<Vec<u8>> {
+    let n_pages = pages.len();
     let doc_height = dp3(page_h_px * n_pages as f64);
     let doc_width = dp3(page_w_px);
-
-    let page_offset = |page_idx: usize, page: &PreparedPage| -> (f64, f64) {
-        let mut min_x = f64::INFINITY;
-        let mut min_y = f64::INFINITY;
-        for s in page.strokes.iter() {
-            let hw = s.width_px * 0.5;
-            for (x, y) in s.points.iter() {
-                min_x = min_x.min(x - hw);
-                min_y = min_y.min(y - hw);
-            }
-        }
-        if !min_x.is_finite() {
-            (0.0, 0.0)
-        } else if options.normalize {
-            (
-                options.margin_px - min_x,
-                page_idx as f64 * page_h_px + options.margin_px - min_y,
-            )
-        } else {
-            (0.0, page_idx as f64 * page_h_px)
-        }
-    };
+    let mm_to_px = |mm: f64| mm / 25.4 * options.dpi;
 
     let (bord_r, bord_g, bord_b) = (0.298, 0.318, 0.341);
     let background = match options.background {
@@ -211,12 +364,19 @@ pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::R
         BackgroundKind::Grid => json!({
             "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
             "pattern": "grid",
-            "pattern_size": [dp3(mm_to_px(5.0)), dp3(mm_to_px(5.0))],
+            "pattern_size": [22.0, 22.0],
             "pattern_color": {"r": 0.8, "g": 0.8, "b": 0.8, "a": 1.0}
         }),
     };
 
-    let orientation = if page_w_px <= page_h_px { "portrait" } else { "landscape" };
+    let orientation = if page_w_px <= page_h_px {
+        "portrait"
+    } else {
+        "landscape"
+    };
+
+    // Single-page documents use the infinite canvas; multi-page single files stack vertically.
+    let layout = if n_pages == 1 { "infinite" } else { "continuous_vertical" };
 
     let document = json!({
         "config": {
@@ -226,11 +386,11 @@ pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::R
                 "dpi": dp3(options.dpi),
                 "orientation": orientation,
                 "border_color": {"r": bord_r, "g": bord_g, "b": bord_b, "a": 1.0},
-                "show_borders": true,
-                "show_origin_indicator": true
+                "show_borders": false,
+                "show_origin_indicator": false
             },
             "background": background,
-            "layout": "continuous_vertical"
+            "layout": layout
         },
         "x": 0.0,
         "y": 0.0,
@@ -244,8 +404,6 @@ pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::R
         "zoom": 1.0
     });
 
-    // Stream the JSON (stroke by stroke) into the gzip writer so that the
-    // peak memory stays bounded by the largest single stroke.
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(5));
     write!(
         encoder,
@@ -256,32 +414,40 @@ pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::R
     )?;
     write!(encoder, r#"{{"value":null,"version":0}}"#)?;
 
-    let mut chrono: u32 = 0;
-    for (page_idx, page) in nonempty.iter().enumerate() {
-        let (dx, dy) = page_offset(page_idx, page);
+    // Flatten all components in page order (strokes then images per page).
+    let mut components: Vec<Value> = Vec::new();
+    for (page, offset) in pages.iter().zip(offsets.iter()) {
+        let (dx, dy) = *offset;
         for s in page.strokes.iter() {
             let moved = OutStroke {
-                points: s
-                    .points
-                    .iter()
-                    .map(|(x, y)| (x + dx, y + dy))
-                    .collect(),
+                points: s.points.iter().map(|(x, y)| (x + dx, y + dy)).collect(),
                 width_px: s.width_px,
                 color_rgba: s.color_rgba,
                 highlighter: s.highlighter,
             };
-            chrono += 1;
-            write!(
-                encoder,
-                ",{}",
-                serde_json::to_string(&json!({"value": stroke_json(&moved), "version": 1}))?
-            )?;
+            components.push(stroke_json(&moved));
         }
+        for img in page.images.iter() {
+            let moved = OutImage {
+                x: img.x + dx,
+                y: img.y + dy,
+                ..img.clone()
+            };
+            components.push(image_json(&moved));
+        }
+    }
+
+    for comp in &components {
+        write!(
+            encoder,
+            ",{}",
+            serde_json::to_string(&json!({"value": comp, "version": 1}))?
+        )?;
     }
 
     write!(encoder, r#"],"chrono_components":[{{"value":null,"version":0}}"#)?;
     let mut t: u32 = 0;
-    for page in nonempty.iter() {
+    for (page, _offset) in pages.iter().zip(offsets.iter()) {
         for s in page.strokes.iter() {
             t += 1;
             let layer = if s.highlighter {
@@ -295,30 +461,227 @@ pub fn build_rnote_bytes(pages: &[PreparedPage], options: &Options) -> anyhow::R
                 serde_json::to_string(&json!({"value": {"t": t, "layer": layer}, "version": 1}))?
             )?;
         }
+        for _img in page.images.iter() {
+            t += 1;
+            write!(
+                encoder,
+                ",{}",
+                serde_json::to_string(&json!({"value": {"t": t, "layer": "image"}, "version": 1}))?
+            )?;
+        }
     }
 
-    write!(encoder, r#"],"chrono_counter":{}"#, chrono)?;
+    write!(encoder, r#"],"chrono_counter":{}"#, t)?;
     encoder.write_all(b"}}}")?;
 
     Ok(encoder.finish()?)
 }
 
-/// Convert OneNote ink-space data into output strokes in pixels.
-pub fn prepare_strokes(pages: &[crate::onedata::PageData], options: &Options) -> Vec<PreparedPage> {
-    pages
+/// Convert one OneNote page into output content (strokes + images) in pixels.
+/// May render PDF media, so it can be somewhat expensive — call it only for pages you export.
+pub fn prepare_page(page: &PageData, options: &Options) -> anyhow::Result<PreparedPage> {
+    let strokes: Vec<OutStroke> = page
+        .strokes
         .iter()
-        .map(|page| {
-            let strokes = page
-                .strokes
-                .iter()
-                .map(|s| convert_stroke(s, options.dpi))
-                .collect();
-            PreparedPage {
-                strokes,
-                height_half_inch: page.height_half_inch,
+        .map(|s| convert_stroke(s, options.dpi))
+        .collect();
+    let mut images = Vec::new();
+    // OneNote almost never stores a usable position for images inside outlines. When a page has
+    // no positioned media at all, every image is laid out in a vertical flow so they never overlap.
+    const MIN_POS: f64 = 0.1; // half-inch
+    let any_positioned = page
+        .media
+        .iter()
+        .any(|m| m.x_half_inch.abs() > MIN_POS || m.y_half_inch.abs() > MIN_POS);
+    let mut flow_x = 0.0f64;
+    let mut flow_y = 0.0f64;
+    const FLOW_GAP_PX: f64 = 10.0;
+    for media in &page.media {
+        if let Some(mut img) = convert_media(media, options.dpi)? {
+            if !any_positioned || (img.x.abs() < 1e-6 && img.y.abs() < 1e-6) {
+                img.x = flow_x;
+                img.y = flow_y;
             }
-        })
-        .collect()
+            images.push(img);
+            flow_x = images.last().unwrap().x;
+            flow_y = images.last().unwrap().y + images.last().unwrap().height + FLOW_GAP_PX;
+        }
+    }
+    Ok(PreparedPage {
+        strokes,
+        images,
+        height_half_inch: page.height_half_inch,
+        guid: page.guid.clone(),
+        title: page.title.clone(),
+    })
+}
+
+/// Convert OneNote page data into output content (strokes + images) in pixels.
+pub fn prepare_strokes(pages: &[PageData], options: &Options) -> anyhow::Result<Vec<PreparedPage>> {
+    let mut out = Vec::with_capacity(pages.len());
+    for page in pages {
+        out.push(prepare_page(page, options)?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    fn build_sample() -> PreparedPage {
+        let strokes = vec![OutStroke {
+            points: vec![(0.0, 0.0), (10.0, 10.0)],
+            width_px: 2.0,
+            color_rgba: (0.0, 0.0, 0.0, 1.0),
+            highlighter: false,
+        }];
+        // 2x2 RGBA8-premultiplied image.
+        let data = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+        let images = vec![OutImage {
+            x: 5.0,
+            y: 6.0,
+            width: 100.0,
+            height: 80.0,
+            pixel_width: 2,
+            pixel_height: 2,
+            data,
+        }];
+        PreparedPage {
+            strokes,
+            images,
+            height_half_inch: Some(600.0),
+            guid: Some("guid".to_string()),
+            title: Some("t".to_string()),
+        }
+    }
+
+    fn gunzip(bytes: &[u8]) -> Value {
+        let mut s = String::new();
+        GzDecoder::new(&bytes[..]).read_to_string(&mut s).unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn bitmapimage_schema_matches_rnote() {
+        let page = build_sample();
+        let options = Options {
+            format: FormatKind::A4,
+            original_pos: true,
+            ..Default::default()
+        };
+        let bytes = build_rnote_bytes_single(&page, &options).unwrap();
+        let root = gunzip(&bytes);
+        let sc = &root["data"]["engine_snapshot"]["stroke_components"];
+        let cc = &root["data"]["engine_snapshot"]["chrono_components"];
+        assert_eq!(sc.as_array().unwrap().len(), cc.as_array().unwrap().len());
+
+        // slot 0 = empty sentinel, slot 1 = stroke, slot 2 = image
+        let image = &sc[2]["value"]["bitmapimage"];
+        assert!(image["image"]["data"].is_string());
+        assert_eq!(image["image"]["memory_format"], "R8g8b8a8Premultiplied");
+        assert_eq!(image["image"]["pixel_width"], 2);
+        assert_eq!(image["image"]["pixel_height"], 2);
+        // image rectangle: identity translation at center (1,1) -> affine [1,0,0,1,1,1]
+        assert_eq!(
+            image["image"]["rectangle"]["affine"],
+            json!([1.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            image["image"]["rectangle"]["cuboid"]["half_extents"],
+            json!([1.0, 1.0])
+        );
+        // display rectangle: center at (5+50, 6+40) = (55, 46)
+        assert_eq!(
+            image["rectangle"]["affine"],
+            json!([1.0, 0.0, 0.0, 1.0, 55.0, 46.0])
+        );
+        assert_eq!(
+            image["rectangle"]["cuboid"]["half_extents"],
+            json!([50.0, 40.0])
+        );
+        // stroke on user_layer 0 (slot 1), image on "image" layer (slot 2)
+        assert_eq!(cc[1]["value"]["layer"], json!({"user_layer": 0}));
+        assert_eq!(cc[2]["value"]["layer"], "image");
+        // chrono_counter counts both components
+        assert_eq!(root["data"]["engine_snapshot"]["chrono_counter"], 2);
+
+        // Defaults: infinite canvas, grid background with 22px tiles, invisible borders.
+        let doc = &root["data"]["engine_snapshot"]["document"];
+        assert_eq!(doc["config"]["layout"], "infinite");
+        assert_eq!(doc["config"]["format"]["show_borders"], false);
+        assert_eq!(doc["config"]["format"]["show_origin_indicator"], false);
+        assert_eq!(doc["config"]["background"]["pattern"], "grid");
+        assert_eq!(doc["config"]["background"]["pattern_size"], json!([22.0, 22.0]));
+    }
+
+    #[test]
+    fn zero_offset_images_flow_vertically() {
+        // Two images with no usable position must not overlap (laid out in a vertical flow).
+        const ONE_PX_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(ONE_PX_PNG)
+            .expect("valid png base64");
+        let mk_media = |w: f64, h: f64| crate::onedata::MediaData {
+            kind: crate::onedata::MediaKind::Image,
+            x_half_inch: 0.0,
+            y_half_inch: 0.0,
+            width_half_inch: w,
+            height_half_inch: h,
+            filename: "img.png".to_string(),
+            bytes: png.clone(),
+            page_index: None,
+        };
+        // widths/heights in half-inches: 2 half-in = 1 inch = 96px at 96 dpi.
+        let page = crate::onedata::PageData {
+            strokes: Vec::new(),
+            media: vec![mk_media(2.0, 2.0), mk_media(2.0, 2.0)],
+            guid: None,
+            updated_time: 0,
+            height_half_inch: None,
+            title: None,
+        };
+        let options = Options::default(); // dpi 96
+        let prepared = prepare_page(&page, &options).unwrap();
+        let bytes = build_rnote_bytes_single(&prepared, &options).unwrap();
+        let root = gunzip(&bytes);
+        let sc = &root["data"]["engine_snapshot"]["stroke_components"];
+        // slot 1 = image 1 (at 0,0), slot 2 = image 2 (flowed below image 1)
+        let img1 = &sc[1]["value"]["bitmapimage"];
+        let img2 = &sc[2]["value"]["bitmapimage"];
+        let h = img1["rectangle"]["cuboid"]["half_extents"][1].as_f64().unwrap();
+        let ty2 = img2["rectangle"]["affine"][5].as_f64().unwrap();
+        let h2 = img2["rectangle"]["cuboid"]["half_extents"][1].as_f64().unwrap();
+        let top2 = ty2 - h2;
+        // image1 spans 0..(2*h); image2 top = 2*h + 10 gap
+        let expected = 2.0 * h + 10.0;
+        assert!((top2 - expected).abs() < 1.0, "image 2 should start at {expected}, got {top2}");
+    }
+
+    #[test]
+    fn image_data_is_base64_premul_pixels() {
+        let page = build_sample();
+        let options = Options {
+            format: FormatKind::A4,
+            original_pos: true,
+            ..Default::default()
+        };
+        let bytes = build_rnote_bytes_single(&page, &options).unwrap();
+        let root = gunzip(&bytes);
+        let data = root["data"]["engine_snapshot"]["stroke_components"][2]["value"]
+            ["bitmapimage"]["image"]["data"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .unwrap();
+        assert_eq!(decoded.len(), 4 * 2 * 2);
+    }
 }
 
 fn convert_stroke(s: &InkStrokeData, dpi: f64) -> OutStroke {

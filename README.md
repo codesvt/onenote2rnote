@@ -7,15 +7,21 @@ Rnote ist eine quelloffene Zeichnungs-/Notizen-App, die ein offenes, versionsbas
 ## Features
 
 - Unterstützt `.one`-Sections, `.onetoc2`- und `.onepkg`-Notebooks sowie Ordner mit `.one`-Dateien
-- Konvertiert komplette Notebook-Ordner (alle Sections) in **eine** `.rnote`-Datei
+- Konvertiert komplette Notebook-Ordner (alle Sections) in **eine** `.rnote`-Datei **oder** pro Seite eine eigene `.rnote`-Datei
 - Erhält Vektor-Strokes (kein Raster), inkl. Farbe, Breite, Transparenz und Highlighter-Erkennung
-- Automatische Seiten-Normalisierung und -Neuanordnung
+- **Medien-Unterstützung**: Bilder und eingebettete PDFs werden auf der Seite platziert (Rnote `bitmapimage`). Im Ordner wird pro Seite **eine gemergte Original-PDF** (`<Seite>-original.pdf`) abgelegt — OneNote speichert ein PDF pro Seite einzeln, das Tool setzt sie mit `pdfunite` wieder zu einem Dokument zusammen. Bilder werden als `*-media-N.png/jpg` beigelegt.
+- **Standard-Layout**: unendliche Leinwand, kariertes Raster mit 22-px-Quadraten, unsichtbare Seitenränder
+- **Inkrementelle Updates** (nur im `--out-dir`-Modus): nur neue/geänderte Seiten werden neu exportiert
+- Automatische Seiten-Normalisierung und -Neuanordnung **oder** exakte Originalposition (`--original-pos`)
 - Wählbares Seitenformat, Hintergrundmuster und DPI
-- Bounded Memory: gzip-Streaming der JSON-Ausgabe stroke-für-stroke
 
 ## Voraussetzungen
 
 - [Rust](https://rustup.rs/) (Cargo + Rustc), Edition 2021
+- [poppler-utils](https://poppler.freedesktop.org/) für **PDF**-Medien (nur nötig, wenn deine Seiten eingebettete PDFs enthalten):
+  ```sh
+  sudo apt install poppler-utils
+  ```
 
 ## Kompilieren
 
@@ -34,35 +40,52 @@ Einzelne `.one`-Section konvertieren und Seiten auflisten:
     -o ~/Documents/Formelsammlungen.rnote --list-pages
 ```
 
-`--list-pages` zeigt alle Seiten samt Anzahl der Strokes pro Seite (sollten > 0 sein).
+`--list-pages` zeigt alle Seiten samt Anzahl der Strokes/Medien und **schreibt keine Dateien** (Dry-Run).
 
-Ganzen Notebook-Ordner konvertieren (alle Sections in eine Datei):
+### Standard: pro Seite eine Datei
+
+Standardmäßig erzeugt das Tool **pro OneNote-Seite eine eigene `.rnote`** — nummeriert und nach Seitentitel benannt, in einen Ordner neben der Eingabe (Ordner = Name der `.one`-Datei):
 
 ```sh
-./target/release/onenote2rnote "/home/user/Documents/Physik.onepkg" \
-    -o ~/Documents/Physik.rnote
+./target/release/onenote2rnote "/home/user/Documents/Formelsammlungen.one"
+```
+→ erzeugt z. B. `~/Documents/Formelsammlungen/01 Formelsammlungen.rnote`, `02 ...rnote`, …
+
+Zusätzlich werden die **Original-Medien** (Bilder/PDFs) als `*-media-N.ext` beigelegt, und unveränderte Seiten bleiben bei erneutem Lauf unberührt (inkrementell über ein Manifest).
+
+Anderes Ausgabeverzeichnis wählen:
+
+```sh
+./target/release/onenote2rnote "/home/user/Documents/Formelsammlungen.one" --out-dir ~/Notizen/Physik
 ```
 
-Ohne `-o` wird der Ausgabepfad aus dem Eingabepfad abgeleitet (Eingabe + `.rnote`).
+### Alle Seiten in eine Datei (optional)
+
+```sh
+./target/release/onenote2rnote "/home/user/Documents/Formelsammlungen.one" -o ~/Documents/Formelsammlungen.rnote
+```
 
 ## CLI-Flags
 
 | Flag | Beschreibung | Standard |
 |------|--------------|----------|
 | `<input>` | `.one`-Datei, `.onetoc2`/`.onepkg`-Notebook oder Ordner | – (Pflicht) |
-| `-o, --output` | Ausgabe-`.rnote`-Datei | Eingabepfad + `.rnote` |
+| `--out-dir <VERZ>` | Ordner für pro-Seite-`.rnote`-Dateien + Original-Medien; inkrementell | Ordner neben Eingabe |
+| `-o, --output` | Alle Seiten in **eine** `.rnote`-Datei (deaktiviert pro-Seite) | – |
+| `--prune` | Dateien/Manifest-Einträge gelöschter Seiten entfernen | aus |
+| `--original-pos` | Inhalte exakt am Original-Ort (keine Ränder/Neuausrichtung) | aus |
 | `--format` | Seitenformat: `a4`, `us_letter`, `source` | `source` |
-| `--background` | Hintergrund: `none`, `lines`, `grid` | `lines` |
+| `--background` | Hintergrund: `none`, `lines`, `grid` (22-px-Raster) | `grid` |
 | `--margin` | Seitenrand in px um die Handschrift | `48` |
 | `--dpi` | DPI des Rnote-Dokuments | `96` |
 | `--min-page-height-mm` | Mindest-Seitenhöhe in mm | – |
 | `--no-normalize` | Handschrift **nicht** auf das Seitenraster verschieben/ausrichten | aus |
-| `--list-pages` | Zusammenfassung gefundener Seiten & Stroke-Zahlen ausgeben | – |
+| `--list-pages` | Zusammenfassung ausgeben, dann beenden (kein Schreiben) | – |
 | `--rnote-version` | Rnote-Dateiformat-Version (muss zur installierten Rnote passen) | `0.15.0` |
 | `-v, --verbose` | Detaillierte Ausgabe | – |
 | `-h, --help` | Hilfe anzeigen | – |
 
-**Tipp:** `--format a4` erzeugt feste, gleichmäßige Seiten. Bei `source` können sehr große OneNote-Seiten die Seiten im Rnote-Dokument stark strecken.
+**Hinweis:** Standard ist eine **unendliche Leinwand** mit kariertem 22-px-Raster und unsichtbaren Seitenrändern. Die Seitengröße (`--format`) wird nur im Ein-Datei-Modus relevant; der Inhalt wird nie aufgebläht oder gestreckt.
 
 ## Ergebnis in Rnote öffnen & validieren
 
@@ -97,8 +120,10 @@ Dann werden die beiden Tests aktiv und prüfen die vollständige Rnote-Ausgabest
 src/
   main.rs        CLI-Einstiegspunkt (clap) & Kommandoausführung
   lib.rs         Modul-Exporte
-  onedata.rs     OneNote-Eingabe parsen (.one / .onetoc2 / .onepkg / Ordner)
-  rnote.rs       Strokes aufbereiten & Rnote-`.rnote`-Datei bauen (gzip + JSON)
+  onedata.rs     OneNote-Eingabe parsen (.one / .onetoc2 / .onepkg / Ordner), Bilder & eingebettete Dateien
+  rnote.rs       Strokes/Medien aufbereiten & Rnote-`.rnote`-Datei bauen (gzip + JSON)
+  pdf.rs         eingebettete PDFs per pdftoppm zu Bitmaps rendern
+  manifest.rs    Inkrementelle Synchronisation (Fingerprint/Manifest)
 tests/
   integration.rs Integrationstests (Struktur & Fehlerfälle)
 ```

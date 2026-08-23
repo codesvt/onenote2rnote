@@ -1,12 +1,26 @@
-use onenote_parser::contents::{Ink, InkStroke};
+use onenote_parser::contents::{
+    Content, EmbeddedFile, FileDataStatus, Ink, InkStroke, OutlineElement, OutlineItem,
+};
 use onenote_parser::notebook::Notebook;
 use onenote_parser::page::{Page, PageContent};
 use onenote_parser::section::{Section, SectionEntry};
 use onenote_parser::Parser;
+use sanitize_filename::sanitize;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use typed_path::TypedPath;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// A raster image to be embedded (and provided as a sidecar file).
+    Image,
+    /// A PDF (or XPS) to be rendered to a bitmap and embedded; the original is provided as a sidecar.
+    Pdf,
+    /// Any other embedded file; only provided as a sidecar, not embedded.
+    Other,
+}
 
 #[derive(Debug, Clone)]
 pub struct InkStrokeData {
@@ -17,9 +31,34 @@ pub struct InkStrokeData {
     pub off_half_inch: (f64, f64),
 }
 
+/// A media item on a page (image or embedded file).
+#[derive(Debug, Clone)]
+pub struct MediaData {
+    pub kind: MediaKind,
+    /// Horizontal offset from the page origin, in half-inch increments.
+    pub x_half_inch: f64,
+    /// Vertical offset from the page origin, in half-inch increments.
+    pub y_half_inch: f64,
+    /// Display width, in half-inch increments.
+    pub width_half_inch: f64,
+    /// Display height, in half-inch increments.
+    pub height_half_inch: f64,
+    /// Original file name, sanitised for safe use as a path component.
+    pub filename: String,
+    /// The binary payload.
+    pub bytes: Vec<u8>,
+    /// Page number to display for multi-page files (0-based), if known.
+    pub page_index: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PageData {
     pub strokes: Vec<InkStrokeData>,
+    pub media: Vec<MediaData>,
+    /// The page GUID used as a stable identity for incremental updates.
+    pub guid: Option<String>,
+    /// Unix timestamp of the last modification.
+    pub updated_time: i64,
     pub height_half_inch: Option<f64>,
     pub title: Option<String>,
 }
@@ -27,6 +66,10 @@ pub struct PageData {
 impl PageData {
     pub fn has_ink(&self) -> bool {
         !self.strokes.is_empty()
+    }
+
+    pub fn has_any_content(&self) -> bool {
+        self.has_ink() || !self.media.is_empty()
     }
 }
 
@@ -149,18 +192,103 @@ fn section_pages(path: &Path) -> anyhow::Result<Vec<PageData>> {
 
 fn page_pages(page: &Page, out: &mut Vec<PageData>) {
     let mut strokes = Vec::new();
+    let mut media = Vec::new();
     for content in page.contents() {
-        if let PageContent::Ink(ink) = content {
-            visit_ink(ink, (0.0, 0.0), &mut strokes);
-        }
+        visit_page_content(content, (0.0, 0.0), &mut strokes, &mut media);
     }
     let height_half_inch = page.height().map(|h| h as f64);
     let title = page.title_text().map(str::to_string);
+    let guid = {
+        let id = page.link_target_id();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    };
+    let updated_time = page.updated_time().unix_timestamp();
     out.push(PageData {
         strokes,
+        media,
+        guid,
+        updated_time,
         height_half_inch,
         title,
     });
+}
+
+fn visit_page_content(
+    content: &PageContent,
+    acc: (f64, f64),
+    strokes: &mut Vec<InkStrokeData>,
+    media: &mut Vec<MediaData>,
+) {
+    match content {
+        PageContent::Ink(ink) => visit_ink(ink, acc, strokes),
+        PageContent::Image(image) => {
+            if let Some(m) = image_media(image, acc) {
+                media.push(m);
+            }
+        }
+        PageContent::EmbeddedFile(embedded) => {
+            if let Some(m) = embedded_media(embedded, acc) {
+                media.push(m);
+            }
+        }
+        PageContent::Outline(outline) => {
+            let off = (
+                acc.0 + outline.offset_horizontal().unwrap_or(0.0) as f64,
+                acc.1 + outline.offset_vertical().unwrap_or(0.0) as f64,
+            );
+            for item in outline.items() {
+                visit_outline_item(item, off, strokes, media);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_outline_item(
+    item: &OutlineItem,
+    acc: (f64, f64),
+    strokes: &mut Vec<InkStrokeData>,
+    media: &mut Vec<MediaData>,
+) {
+    match item {
+        OutlineItem::Element(element) => visit_outline_element(element, acc, strokes, media),
+        OutlineItem::Group(group) => {
+            for item in group.outlines() {
+                visit_outline_item(item, acc, strokes, media);
+            }
+        }
+    }
+}
+
+fn visit_outline_element(
+    element: &OutlineElement,
+    acc: (f64, f64),
+    strokes: &mut Vec<InkStrokeData>,
+    media: &mut Vec<MediaData>,
+) {
+    for content in element.contents() {
+        match content {
+            Content::Ink(ink) => visit_ink(ink, acc, strokes),
+            Content::Image(image) => {
+                if let Some(m) = image_media(image, acc) {
+                    media.push(m);
+                }
+            }
+            Content::EmbeddedFile(embedded) => {
+                if let Some(m) = embedded_media(embedded, acc) {
+                    media.push(m);
+                }
+            }
+            _ => {}
+        }
+    }
+    for item in element.children() {
+        visit_outline_item(item, acc, strokes, media);
+    }
 }
 
 fn visit_ink(ink: &Ink, acc: (f64, f64), out: &mut Vec<InkStrokeData>) {
@@ -215,3 +343,89 @@ fn stroke_data(stroke: &InkStroke, off: (f64, f64)) -> Option<InkStrokeData> {
     })
 }
 
+fn image_media(
+    image: &onenote_parser::contents::Image,
+    acc: (f64, f64),
+) -> Option<MediaData> {
+    if image.data_status() != FileDataStatus::Available {
+        return None;
+    }
+    let mut reader = image.read()?;
+    let mut bytes = Vec::new();
+    if reader.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+        return None;
+    }
+
+    let x = acc.0 + image.offset_horizontal().unwrap_or(0.0) as f64;
+    let y = acc.1 + image.offset_vertical().unwrap_or(0.0) as f64;
+    let width = image
+        .picture_width()
+        .or_else(|| image.layout_max_width())
+        .unwrap_or(0.0) as f64;
+    let height = image
+        .picture_height()
+        .or_else(|| image.layout_max_height())
+        .unwrap_or(0.0) as f64;
+
+    let raw_name = image
+        .image_filename()
+        .or_else(|| image.alt_text())
+        .map(str::to_string)
+        .unwrap_or_else(|| "image".to_string());
+    let ext = image.extension().map(str::to_lowercase);
+    let is_multi_page_file = ext.as_deref().is_some_and(|e| matches!(e, "pdf" | "xps"));
+
+    let kind = if is_multi_page_file {
+        MediaKind::Pdf
+    } else {
+        MediaKind::Image
+    };
+
+    Some(MediaData {
+        kind,
+        x_half_inch: x,
+        y_half_inch: y,
+        width_half_inch: width,
+        height_half_inch: height,
+        filename: sanitize(&raw_name),
+        bytes,
+        page_index: image.displayed_page_number(),
+    })
+}
+
+fn embedded_media(embedded: &EmbeddedFile, acc: (f64, f64)) -> Option<MediaData> {
+    if embedded.data_status() != FileDataStatus::Available {
+        return None;
+    }
+    let mut reader = embedded.read();
+    let mut bytes = Vec::new();
+    if reader.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+        return None;
+    }
+
+    let raw_name = embedded.filename();
+    let ext = Path::new(raw_name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_lowercase);
+    let kind = match ext.as_deref() {
+        Some("pdf") | Some("xps") => MediaKind::Pdf,
+        _ => MediaKind::Other,
+    };
+
+    let x = acc.0 + embedded.offset_horizontal().unwrap_or(0.0) as f64;
+    let y = acc.1 + embedded.offset_vertical().unwrap_or(0.0) as f64;
+    let width = embedded.layout_max_width().unwrap_or(0.0) as f64;
+    let height = embedded.layout_max_height().unwrap_or(0.0) as f64;
+
+    Some(MediaData {
+        kind,
+        x_half_inch: x,
+        y_half_inch: y,
+        width_half_inch: width,
+        height_half_inch: height,
+        filename: sanitize(raw_name),
+        bytes,
+        page_index: None,
+    })
+}
