@@ -1,0 +1,18 @@
+[package]
+name = "onenote2rnote"
+version = "0.1.0"
+edition = "2021"
+description = "Convert OneNote handwritten notes (.one / .onepkg) to Rnote (.rnote), preserving vector strokes"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "onenote2rnote"
+path = "src/main.rs"
+
+[dependencies]
+onenote_parser = { version = "2", features = ["onepkg"] }
+typed-path = "0.12"
+serde_json = "1"
+flate2 = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
