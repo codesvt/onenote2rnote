@@ -134,22 +134,30 @@ fn stroke_json(stroke: &OutStroke) -> Value {
     })
 }
 
-/// A `Rectangle` (parry Cuboid + glamx DAffine2) placed at `(x, y)` with the given extents.
-/// `affine` is the flat 6-element column-major array `[x_axis.x, x_axis.y, y_axis.x, y_axis.y, z_axis.x, z_axis.y]`.
-fn rectangle_json(half_w: f64, half_h: f64, cx: f64, cy: f64) -> Value {
-    json!({
-        "cuboid": {"half_extents": [dp3(half_w), dp3(half_h)]},
-        "affine": [1.0, 0.0, 0.0, 1.0, dp3(cx), dp3(cy)]
-    })
+/// A `Rectangle` (parry Cuboid + DAffine2) placed at `(x, y)` with the given extents.
+///
+/// The affine is the row-major 2D matrix `[x_axis, y_axis, translation]`, serialised by Rnote's
+/// `DAffine2` as the 9-element array `[m11, m12, 0, m21, m22, 0, tx, ty, 1]` with the translation
+/// at indices 6 and 7 (the center of the cuboid). For the 0.14 file format Rnote nests this under
+/// a `transform` key; 0.15 uses a flat `affine` key.
+fn rectangle_json(half_w: f64, half_h: f64, cx: f64, cy: f64, v014: bool) -> Value {
+    let affine = json!([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, dp3(cx), dp3(cy), 1.0]);
+    let cuboid = json!({"half_extents": [dp3(half_w), dp3(half_h)]});
+    if v014 {
+        json!({"cuboid": cuboid, "transform": {"affine": affine}})
+    } else {
+        json!({"cuboid": cuboid, "affine": affine})
+    }
 }
 
-fn image_json(image: &OutImage) -> Value {
+fn image_json(image: &OutImage, v014: bool) -> Value {
     // Display rectangle spans `x..x+width` x `y..y+height` (center = x+w/2, y+h/2).
     let display = rectangle_json(
         image.width * 0.5,
         image.height * 0.5,
         image.x + image.width * 0.5,
         image.y + image.height * 0.5,
+        v014,
     );
     // The embedded image's own rectangle spans 0..pixel_width x 0..pixel_height.
     let image_rect = rectangle_json(
@@ -157,6 +165,7 @@ fn image_json(image: &OutImage) -> Value {
         image.pixel_height as f64 * 0.5,
         image.pixel_width as f64 * 0.5,
         image.pixel_height as f64 * 0.5,
+        v014,
     );
 
     json!({
@@ -414,6 +423,9 @@ fn build_document(
     )?;
     write!(encoder, r#"{{"value":null,"version":0}}"#)?;
 
+    // The 0.14 file format nests the rectangle affine under a `transform` key; 0.15 uses `affine`.
+    let v014 = options.rnote_version.starts_with("0.14");
+
     // Flatten all components in page order (strokes then images per page).
     let mut components: Vec<Value> = Vec::new();
     for (page, offset) in pages.iter().zip(offsets.iter()) {
@@ -433,7 +445,7 @@ fn build_document(
                 y: img.y + dy,
                 ..img.clone()
             };
-            components.push(image_json(&moved));
+            components.push(image_json(&moved, v014));
         }
     }
 
@@ -485,27 +497,77 @@ pub fn prepare_page(page: &PageData, options: &Options) -> anyhow::Result<Prepar
         .iter()
         .map(|s| convert_stroke(s, options.dpi))
         .collect();
-    let mut images = Vec::new();
-    // OneNote almost never stores a usable position for images inside outlines. When a page has
-    // no positioned media at all, every image is laid out in a vertical flow so they never overlap.
+
+    // A multi-page printout is represented by one preview image per page; the original PDF is
+    // only exported as a sidecar and must not be embedded again on top of its previews.
+    let has_previews = page.media.iter().any(|m| m.is_preview);
+
     const MIN_POS: f64 = 0.1; // half-inch
-    let any_positioned = page
-        .media
-        .iter()
-        .any(|m| m.x_half_inch.abs() > MIN_POS || m.y_half_inch.abs() > MIN_POS);
-    let mut flow_x = 0.0f64;
-    let mut flow_y = 0.0f64;
-    const FLOW_GAP_PX: f64 = 10.0;
-    for media in &page.media {
-        if let Some(mut img) = convert_media(media, options.dpi)? {
-            if !any_positioned || (img.x.abs() < 1e-6 && img.y.abs() < 1e-6) {
-                img.x = flow_x;
-                img.y = flow_y;
+    // Rnote's own PDF import places successive pages `height + IMPORT_OFFSET_DEFAULT[1]*0.5`
+    // apart, with `IMPORT_OFFSET_DEFAULT = 32` -> a 16 px vertical gap between pages.
+    const FLOW_GAP_PX: f64 = 16.0;
+    const OVERLAP_TOL_PX: f64 = 2.0;
+
+    let mut images: Vec<OutImage> = Vec::new();
+
+    // Printout pages are laid out exactly like Rnote's PDF import: every page below the previous
+    // one, starting at the top, so the pages never stack on top of each other.
+    if has_previews {
+        let mut y = 0.0f64;
+        for media in &page.media {
+            if !media.is_preview {
+                continue;
             }
-            images.push(img);
-            flow_x = images.last().unwrap().x;
-            flow_y = images.last().unwrap().y + images.last().unwrap().height + FLOW_GAP_PX;
+            if let Some(mut img) = convert_media(media, options.dpi)? {
+                img.x = 0.0;
+                img.y = y;
+                images.push(img);
+                y += images.last().unwrap().height + FLOW_GAP_PX;
+            }
         }
+    }
+
+    // Other images (photos, scans, standalone PDFs): keep a usable position, otherwise flow.
+    // They are pushed down until they no longer overlap an already placed image, so they always
+    // sit below the printout (or below each other) and never stack.
+    let mut flow_y = images
+        .iter()
+        .map(|i| i.y + i.height + FLOW_GAP_PX)
+        .fold(0.0f64, f64::max);
+    for media in &page.media {
+        if media.is_preview {
+            continue;
+        }
+        if media.kind == MediaKind::Pdf && has_previews {
+            continue; // printout original is only exported as the merged sidecar
+        }
+        let Some(mut img) = convert_media(media, options.dpi)? else {
+            continue;
+        };
+        let positioned =
+            media.x_half_inch.abs() > MIN_POS || media.y_half_inch.abs() > MIN_POS;
+        if !positioned {
+            img.x = 0.0;
+            img.y = flow_y;
+        }
+        // Move the image down until it no longer overlaps any previously placed image.
+        let mut guard = 0usize;
+        loop {
+            let mut overlapped = false;
+            for other in &images {
+                if rects_overlap(&img, other, OVERLAP_TOL_PX) {
+                    img.y = other.y + other.height + FLOW_GAP_PX;
+                    overlapped = true;
+                }
+            }
+            guard += 1;
+            if !overlapped || guard > images.len() + 1 {
+                break;
+            }
+        }
+        let bottom = img.y + img.height + FLOW_GAP_PX;
+        images.push(img);
+        flow_y = flow_y.max(bottom);
     }
     Ok(PreparedPage {
         strokes,
@@ -514,6 +576,14 @@ pub fn prepare_page(page: &PageData, options: &Options) -> anyhow::Result<Prepar
         guid: page.guid.clone(),
         title: page.title.clone(),
     })
+}
+
+/// True when two images overlap by more than `tol` pixels (both axes, so edge-touching is ignored).
+fn rects_overlap(a: &OutImage, b: &OutImage, tol: f64) -> bool {
+    a.x < b.x + b.width - tol
+        && b.x < a.x + a.width - tol
+        && a.y < b.y + b.height - tol
+        && b.y < a.y + a.height - tol
 }
 
 /// Convert OneNote page data into output content (strokes + images) in pixels.
@@ -584,10 +654,10 @@ mod tests {
         assert_eq!(image["image"]["memory_format"], "R8g8b8a8Premultiplied");
         assert_eq!(image["image"]["pixel_width"], 2);
         assert_eq!(image["image"]["pixel_height"], 2);
-        // image rectangle: identity translation at center (1,1) -> affine [1,0,0,1,1,1]
+        // image rectangle: identity transform centered at (1,1) -> affine [1,0,0, 0,1,0, 1,1,1]
         assert_eq!(
             image["image"]["rectangle"]["affine"],
-            json!([1.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+            json!([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0])
         );
         assert_eq!(
             image["image"]["rectangle"]["cuboid"]["half_extents"],
@@ -596,7 +666,7 @@ mod tests {
         // display rectangle: center at (5+50, 6+40) = (55, 46)
         assert_eq!(
             image["rectangle"]["affine"],
-            json!([1.0, 0.0, 0.0, 1.0, 55.0, 46.0])
+            json!([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 55.0, 46.0, 1.0])
         );
         assert_eq!(
             image["rectangle"]["cuboid"]["half_extents"],
@@ -618,6 +688,28 @@ mod tests {
     }
 
     #[test]
+    fn rnote_014_uses_nested_transform_affine() {
+        // Rnote 0.14 nests the rectangle affine under a `transform` key (9-element row-major).
+        let page = build_sample();
+        let options = Options {
+            rnote_version: "0.14.2".to_string(),
+            format: FormatKind::A4,
+            original_pos: true,
+            ..Default::default()
+        };
+        let bytes = build_rnote_bytes_single(&page, &options).unwrap();
+        let root = gunzip(&bytes);
+        let sc = &root["data"]["engine_snapshot"]["stroke_components"];
+        assert_eq!(root["version"], "0.14.2");
+        let image = &sc[2]["value"]["bitmapimage"];
+        assert_eq!(
+            image["rectangle"]["transform"]["affine"],
+            json!([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 55.0, 46.0, 1.0])
+        );
+        assert!(image["rectangle"].get("affine").is_none(), "0.14 must not use a flat affine");
+    }
+
+    #[test]
     fn zero_offset_images_flow_vertically() {
         // Two images with no usable position must not overlap (laid out in a vertical flow).
         const ONE_PX_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -634,6 +726,7 @@ mod tests {
             filename: "img.png".to_string(),
             bytes: png.clone(),
             page_index: None,
+            is_preview: false,
         };
         // widths/heights in half-inches: 2 half-in = 1 inch = 96px at 96 dpi.
         let page = crate::onedata::PageData {
@@ -653,12 +746,97 @@ mod tests {
         let img1 = &sc[1]["value"]["bitmapimage"];
         let img2 = &sc[2]["value"]["bitmapimage"];
         let h = img1["rectangle"]["cuboid"]["half_extents"][1].as_f64().unwrap();
-        let ty2 = img2["rectangle"]["affine"][5].as_f64().unwrap();
+        let ty2 = img2["rectangle"]["affine"][7].as_f64().unwrap();
         let h2 = img2["rectangle"]["cuboid"]["half_extents"][1].as_f64().unwrap();
         let top2 = ty2 - h2;
-        // image1 spans 0..(2*h); image2 top = 2*h + 10 gap
-        let expected = 2.0 * h + 10.0;
+        // image1 spans 0..(2*h); image2 top = 2*h + 16 gap
+        let expected = 2.0 * h + 16.0;
         assert!((top2 - expected).abs() < 1.0, "image 2 should start at {expected}, got {top2}");
+    }
+
+    #[test]
+    fn same_position_images_are_separated_vertically() {
+        // Two images placed at the exact same OneNote position (e.g. an embedded PDF and a pasted
+        // photo of the same sheet) must not overlap: the second one is pushed below the first.
+        const ONE_PX_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(ONE_PX_PNG)
+            .expect("valid png base64");
+        let mk_media = |w: f64, h: f64| crate::onedata::MediaData {
+            kind: crate::onedata::MediaKind::Image,
+            x_half_inch: 1.0,
+            y_half_inch: 2.4,
+            width_half_inch: w,
+            height_half_inch: h,
+            filename: "media.png".to_string(),
+            bytes: png.clone(),
+            page_index: None,
+            is_preview: false,
+        };
+        let page = crate::onedata::PageData {
+            strokes: Vec::new(),
+            media: vec![mk_media(2.0, 2.0), mk_media(2.0, 2.0)],
+            guid: None,
+            updated_time: 0,
+            height_half_inch: None,
+            title: None,
+        };
+        let options = Options::default(); // dpi 96
+        let prepared = prepare_page(&page, &options).unwrap();
+        assert_eq!(prepared.images.len(), 2);
+        let (a, b) = (&prepared.images[0], &prepared.images[1]);
+        assert!((a.x - 48.0).abs() < 1.0 && (a.y - 115.2).abs() < 1.0, "first keeps its position");
+        // Both start with the same origin; the second must have been pushed down out of the first.
+        assert!(b.y >= a.y + a.height + 16.0 - 0.01, "second must sit below the first");
+    }
+
+    #[test]
+    fn printout_previews_are_kept_and_original_pdf_not_embedded() {
+        // A PDF printout page: N preview images (displayed_page_number set) + the original PDF.
+        // prepare_page must embed the previews but NOT render the original PDF again.
+        const ONE_PX_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(ONE_PX_PNG)
+            .expect("valid png base64");
+        let mk_preview = |y: f64| crate::onedata::MediaData {
+            kind: crate::onedata::MediaKind::Image,
+            x_half_inch: 1.0,
+            y_half_inch: y,
+            width_half_inch: 2.0,
+            height_half_inch: 2.0,
+            filename: "printout_2.pdf".to_string(),
+            bytes: png.clone(),
+            page_index: Some(2),
+            is_preview: true,
+        };
+        let original = crate::onedata::MediaData {
+            kind: crate::onedata::MediaKind::Pdf,
+            x_half_inch: 1.0,
+            y_half_inch: 2.4,
+            width_half_inch: 2.0,
+            height_half_inch: 2.0,
+            filename: "printout.pdf".to_string(),
+            bytes: png.clone(),
+            page_index: None,
+            is_preview: false,
+        };
+        let page = crate::onedata::PageData {
+            strokes: Vec::new(),
+            media: vec![mk_preview(2.4), mk_preview(24.0), original],
+            guid: None,
+            updated_time: 0,
+            height_half_inch: None,
+            title: None,
+        };
+        let options = Options::default();
+        let prepared = prepare_page(&page, &options).unwrap();
+        // Only the two previews are embedded; the original PDF is not re-rendered.
+        assert_eq!(prepared.images.len(), 2);
+        for img in &prepared.images {
+            assert_eq!(img.pixel_width, 1, "preview decoded as a bitmap, not rendered as PDF");
+        }
     }
 
     #[test]

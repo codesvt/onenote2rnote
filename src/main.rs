@@ -138,6 +138,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A stable key for the output options that influence the produced file bytes. Any change here
+/// invalidates every previously exported page (see `export_to_dir`).
+fn fingerprint_options(options: &Options) -> String {
+    format!(
+        "v{}|dpi{}|f{:?}|min{:?}|m{}|bg{:?}|norm{}|orig{}",
+        options.rnote_version,
+        options.dpi,
+        options.format,
+        options.min_page_height_mm,
+        options.margin_px,
+        options.background,
+        options.normalize,
+        options.original_pos
+    )
+}
+
 /// Default per-page output directory: a folder next to the input, named after the input file.
 fn default_out_dir(input: &Path) -> PathBuf {
     let stem = input
@@ -220,7 +236,10 @@ fn export_to_dir(
             continue;
         };
 
-        let fp = fingerprint_page(page);
+        // The per-page cache key must cover the output options: a change to `--rnote-version`,
+        // `--dpi`, `--format`, `--margin`, … changes the produced bytes, so it must invalidate
+        // previously exported pages instead of silently keeping stale output.
+        let fp = format!("{}|{}", fingerprint_options(options), fingerprint_page(page));
         let already = !force_reexport
             && manifest.pages.get(guid).map(|e| e.fingerprint.as_str()) == Some(fp.as_str());
 
@@ -313,8 +332,8 @@ fn export_page(page: &PageData, stem: &str, out_dir: &Path, options: &Options) -
     }
 
     for (i, media) in page.media.iter().enumerate() {
-        if media.kind == MediaKind::Pdf {
-            continue; // handled above as part of the merged original
+        if media.kind == MediaKind::Pdf || media.is_preview {
+            continue; // PDFs are handled above as part of the merged original; previews are placeholders for it
         }
         let ext = detect_media_ext(&media.bytes, media.kind);
         let name = format!("{stem}-media-{}.{}", i + 1, ext);
@@ -354,4 +373,4 @@ fn default_output(input: &Path) -> PathBuf {
 
 const MANIFEST_NAME: &str = ".onenote2rnote-manifest.json";
 /// Bump to force re-export of all pages (e.g. when the output format changes).
-const MANIFEST_VERSION: u32 = 2;
+const MANIFEST_VERSION: u32 = 4;

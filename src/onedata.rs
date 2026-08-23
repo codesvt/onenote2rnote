@@ -49,6 +49,9 @@ pub struct MediaData {
     pub bytes: Vec<u8>,
     /// Page number to display for multi-page files (0-based), if known.
     pub page_index: Option<u32>,
+    /// True for the per-page preview images of an inserted multi-page printout (PDF/XPS).
+    /// These are only visual placeholders for the original file, which is exported separately.
+    pub is_preview: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +384,11 @@ fn image_media(
         MediaKind::Image
     };
 
+    // OneNote stores an inserted PDF/XPS printout as one preview image per page; each such
+    // image carries a displayed page number and is only a visual placeholder for the original
+    // multi-page file (which is exported separately as a single PDF sidecar).
+    let is_preview = image.displayed_page_number().is_some();
+
     Some(MediaData {
         kind,
         x_half_inch: x,
@@ -390,6 +398,7 @@ fn image_media(
         filename: sanitize(&raw_name),
         bytes,
         page_index: image.displayed_page_number(),
+        is_preview,
     })
 }
 
@@ -427,5 +436,6 @@ fn embedded_media(embedded: &EmbeddedFile, acc: (f64, f64)) -> Option<MediaData>
         filename: sanitize(raw_name),
         bytes,
         page_index: None,
+        is_preview: false,
     })
 }

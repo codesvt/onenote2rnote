@@ -85,7 +85,13 @@ Anderes Ausgabeverzeichnis wählen:
 | `-v, --verbose` | Detaillierte Ausgabe | – |
 | `-h, --help` | Hilfe anzeigen | – |
 
-**Hinweis:** Standard ist eine **unendliche Leinwand** mit kariertem 22-px-Raster und unsichtbaren Seitenrändern. Die Seitengröße (`--format`) wird nur im Ein-Datei-Modus relevant; der Inhalt wird nie aufgebläht oder gestreckt.
+**Wichtig (`--rnote-version`):** Die Version **muss** exakt zur installierten Rnote passen, sonst kann Rnote die Bild-Positionen nicht lesen und stapelt alle Bilder übereinander. Rnote 0.14 und 0.15 verwenden unterschiedliche Formate (0.14 verschachtelt die affine-Matrix unter `transform`, 0.15 nutzt ein flaches `affine`). Bei Rnote 0.14.x z.B.:
+
+```sh
+onenote2rnote --out-dir out --rnote-version 0.14.2 "Formelsammlungen.one"
+```
+
+**Hinweis:** Standard ist eine **unendliche Leinwand** mit kariertem 22-px-Raster und unsichtbaren Seitenrändern. Die Seitengröße (`--format`) wird nur im Ein-Datei-Modus relevant; der Inhalt wird nie aufgebläht oder gestreckt. Ein mehrseitiger PDF-Druck wird wie Rnotes eigener PDF-Import platziert: jede Seite unter der vorherigen (16-px-Abstand), das Original-PDF nur als `-original.pdf`-Sidecar.
 
 ## Ergebnis in Rnote öffnen & validieren
 
