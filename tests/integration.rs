@@ -1,13 +1,14 @@
 use flate2::read::GzDecoder;
 use onenote2rnote::onedata;
-use onenote2rnote::rnote::{FormatKind, Options, prepare_strokes};
-use serde_json::{Value, json};
+use onenote2rnote::rnote::{prepare_strokes, FormatKind, Options};
+use serde_json::{json, Value};
 use std::io::Read;
 use std::path::Path;
 
 #[test]
 fn real_sample_extracts_ink_and_builds_valid_rnote_structure() {
-    let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/samples/desktop_missing_ink.one");
+    let sample =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/samples/desktop_missing_ink.one");
     if !sample.exists() {
         eprintln!("skipping: sample file not present");
         return;
@@ -49,7 +50,9 @@ fn real_sample_extracts_ink_and_builds_valid_rnote_structure() {
         assert!(snapshot.get(key).is_some(), "missing engine key {key}");
     }
 
-    let sc = snapshot["stroke_components"].as_array().expect("slotmap array");
+    let sc = snapshot["stroke_components"]
+        .as_array()
+        .expect("slotmap array");
     let cc = snapshot["chrono_components"]
         .as_array()
         .expect("chrono slotmap array");

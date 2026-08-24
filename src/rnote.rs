@@ -1,7 +1,7 @@
 use crate::onedata::{InkStrokeData, MediaData, MediaKind, PageData};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::Write;
 
 pub const INK_UNITS_PER_INCH: f64 = 2540.0;
@@ -356,6 +356,8 @@ fn build_document(
     let doc_width = dp3(page_w_px);
     let mm_to_px = |mm: f64| mm / 25.4 * options.dpi;
 
+    // Rnote's default border color (must match exactly; 0.318 is not a constant approximation).
+    #[allow(clippy::approx_constant)]
     let (bord_r, bord_g, bord_b) = (0.298, 0.318, 0.341);
     let background = match options.background {
         BackgroundKind::None => json!({
@@ -385,7 +387,11 @@ fn build_document(
     };
 
     // Single-page documents use the infinite canvas; multi-page single files stack vertically.
-    let layout = if n_pages == 1 { "infinite" } else { "continuous_vertical" };
+    let layout = if n_pages == 1 {
+        "infinite"
+    } else {
+        "continuous_vertical"
+    };
 
     let document = json!({
         "config": {
@@ -457,7 +463,10 @@ fn build_document(
         )?;
     }
 
-    write!(encoder, r#"],"chrono_components":[{{"value":null,"version":0}}"#)?;
+    write!(
+        encoder,
+        r#"],"chrono_components":[{{"value":null,"version":0}}"#
+    )?;
     let mut t: u32 = 0;
     for (page, _offset) in pages.iter().zip(offsets.iter()) {
         for s in page.strokes.iter() {
@@ -503,8 +512,8 @@ pub fn prepare_page(page: &PageData, options: &Options) -> anyhow::Result<Prepar
     let has_previews = page.media.iter().any(|m| m.is_preview);
 
     const MIN_POS: f64 = 0.1; // half-inch
-    // Rnote's own PDF import places successive pages `height + IMPORT_OFFSET_DEFAULT[1]*0.5`
-    // apart, with `IMPORT_OFFSET_DEFAULT = 32` -> a 16 px vertical gap between pages.
+                              // Rnote's own PDF import places successive pages `height + IMPORT_OFFSET_DEFAULT[1]*0.5`
+                              // apart, with `IMPORT_OFFSET_DEFAULT = 32` -> a 16 px vertical gap between pages.
     const FLOW_GAP_PX: f64 = 16.0;
     const OVERLAP_TOL_PX: f64 = 2.0;
 
@@ -544,8 +553,7 @@ pub fn prepare_page(page: &PageData, options: &Options) -> anyhow::Result<Prepar
         let Some(mut img) = convert_media(media, options.dpi)? else {
             continue;
         };
-        let positioned =
-            media.x_half_inch.abs() > MIN_POS || media.y_half_inch.abs() > MIN_POS;
+        let positioned = media.x_half_inch.abs() > MIN_POS || media.y_half_inch.abs() > MIN_POS;
         if !positioned {
             img.x = 0.0;
             img.y = flow_y;
@@ -595,6 +603,41 @@ pub fn prepare_strokes(pages: &[PageData], options: &Options) -> anyhow::Result<
     Ok(out)
 }
 
+fn convert_stroke(s: &InkStrokeData, dpi: f64) -> OutStroke {
+    let scale = dpi / INK_UNITS_PER_INCH;
+    let off_scale = dpi / 2.0;
+    let ox = s.off_half_inch.0 * off_scale;
+    let oy = s.off_half_inch.1 * off_scale;
+
+    let points: Vec<(f64, f64)> = s
+        .points
+        .iter()
+        .map(|(x, y)| (x * scale + ox, y * scale + oy))
+        .collect();
+
+    let width_px = (s.width_ink * scale).clamp(0.5, 60.0);
+
+    let (r, g, b) = match s.color {
+        Some(value) => {
+            let r = (value & 0xFF) as f64 / 255.0;
+            let g = ((value >> 8) & 0xFF) as f64 / 255.0;
+            let b = ((value >> 16) & 0xFF) as f64 / 255.0;
+            (r, g, b)
+        }
+        None => (0.0, 0.0, 0.0),
+    };
+    let a = (255.0 - s.transparency.unwrap_or(0) as f64) / 255.0;
+
+    let highlighter = a < 0.55;
+
+    OutStroke {
+        points,
+        width_px,
+        color_rgba: (r, g, b, a.clamp(0.0, 1.0)),
+        highlighter,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,7 +652,9 @@ mod tests {
             highlighter: false,
         }];
         // 2x2 RGBA8-premultiplied image.
-        let data = vec![255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+        let data = vec![
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
         let images = vec![OutImage {
             x: 5.0,
             y: 6.0,
@@ -630,7 +675,7 @@ mod tests {
 
     fn gunzip(bytes: &[u8]) -> Value {
         let mut s = String::new();
-        GzDecoder::new(&bytes[..]).read_to_string(&mut s).unwrap();
+        GzDecoder::new(bytes).read_to_string(&mut s).unwrap();
         serde_json::from_str(&s).unwrap()
     }
 
@@ -684,7 +729,10 @@ mod tests {
         assert_eq!(doc["config"]["format"]["show_borders"], false);
         assert_eq!(doc["config"]["format"]["show_origin_indicator"], false);
         assert_eq!(doc["config"]["background"]["pattern"], "grid");
-        assert_eq!(doc["config"]["background"]["pattern_size"], json!([22.0, 22.0]));
+        assert_eq!(
+            doc["config"]["background"]["pattern_size"],
+            json!([22.0, 22.0])
+        );
     }
 
     #[test]
@@ -706,7 +754,10 @@ mod tests {
             image["rectangle"]["transform"]["affine"],
             json!([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 55.0, 46.0, 1.0])
         );
-        assert!(image["rectangle"].get("affine").is_none(), "0.14 must not use a flat affine");
+        assert!(
+            image["rectangle"].get("affine").is_none(),
+            "0.14 must not use a flat affine"
+        );
     }
 
     #[test]
@@ -745,13 +796,20 @@ mod tests {
         // slot 1 = image 1 (at 0,0), slot 2 = image 2 (flowed below image 1)
         let img1 = &sc[1]["value"]["bitmapimage"];
         let img2 = &sc[2]["value"]["bitmapimage"];
-        let h = img1["rectangle"]["cuboid"]["half_extents"][1].as_f64().unwrap();
+        let h = img1["rectangle"]["cuboid"]["half_extents"][1]
+            .as_f64()
+            .unwrap();
         let ty2 = img2["rectangle"]["affine"][7].as_f64().unwrap();
-        let h2 = img2["rectangle"]["cuboid"]["half_extents"][1].as_f64().unwrap();
+        let h2 = img2["rectangle"]["cuboid"]["half_extents"][1]
+            .as_f64()
+            .unwrap();
         let top2 = ty2 - h2;
         // image1 spans 0..(2*h); image2 top = 2*h + 16 gap
         let expected = 2.0 * h + 16.0;
-        assert!((top2 - expected).abs() < 1.0, "image 2 should start at {expected}, got {top2}");
+        assert!(
+            (top2 - expected).abs() < 1.0,
+            "image 2 should start at {expected}, got {top2}"
+        );
     }
 
     #[test]
@@ -786,9 +844,15 @@ mod tests {
         let prepared = prepare_page(&page, &options).unwrap();
         assert_eq!(prepared.images.len(), 2);
         let (a, b) = (&prepared.images[0], &prepared.images[1]);
-        assert!((a.x - 48.0).abs() < 1.0 && (a.y - 115.2).abs() < 1.0, "first keeps its position");
+        assert!(
+            (a.x - 48.0).abs() < 1.0 && (a.y - 115.2).abs() < 1.0,
+            "first keeps its position"
+        );
         // Both start with the same origin; the second must have been pushed down out of the first.
-        assert!(b.y >= a.y + a.height + 16.0 - 0.01, "second must sit below the first");
+        assert!(
+            b.y >= a.y + a.height + 16.0 - 0.01,
+            "second must sit below the first"
+        );
     }
 
     #[test]
@@ -835,7 +899,10 @@ mod tests {
         // Only the two previews are embedded; the original PDF is not re-rendered.
         assert_eq!(prepared.images.len(), 2);
         for img in &prepared.images {
-            assert_eq!(img.pixel_width, 1, "preview decoded as a bitmap, not rendered as PDF");
+            assert_eq!(
+                img.pixel_width, 1,
+                "preview decoded as a bitmap, not rendered as PDF"
+            );
         }
     }
 
@@ -849,8 +916,8 @@ mod tests {
         };
         let bytes = build_rnote_bytes_single(&page, &options).unwrap();
         let root = gunzip(&bytes);
-        let data = root["data"]["engine_snapshot"]["stroke_components"][2]["value"]
-            ["bitmapimage"]["image"]["data"]
+        let data = root["data"]["engine_snapshot"]["stroke_components"][2]["value"]["bitmapimage"]
+            ["image"]["data"]
             .as_str()
             .unwrap()
             .to_string();
@@ -859,40 +926,5 @@ mod tests {
             .decode(&data)
             .unwrap();
         assert_eq!(decoded.len(), 4 * 2 * 2);
-    }
-}
-
-fn convert_stroke(s: &InkStrokeData, dpi: f64) -> OutStroke {
-    let scale = dpi / INK_UNITS_PER_INCH;
-    let off_scale = dpi / 2.0;
-    let ox = s.off_half_inch.0 * off_scale;
-    let oy = s.off_half_inch.1 * off_scale;
-
-    let points: Vec<(f64, f64)> = s
-        .points
-        .iter()
-        .map(|(x, y)| (x * scale + ox, y * scale + oy))
-        .collect();
-
-    let width_px = (s.width_ink * scale).clamp(0.5, 60.0);
-
-    let (r, g, b) = match s.color {
-        Some(value) => {
-            let r = (value & 0xFF) as f64 / 255.0;
-            let g = ((value >> 8) & 0xFF) as f64 / 255.0;
-            let b = ((value >> 16) & 0xFF) as f64 / 255.0;
-            (r, g, b)
-        }
-        None => (0.0, 0.0, 0.0),
-    };
-    let a = (255.0 - s.transparency.unwrap_or(0) as f64) / 255.0;
-
-    let highlighter = a < 0.55;
-
-    OutStroke {
-        points,
-        width_px,
-        color_rgba: (r, g, b, a.clamp(0.0, 1.0)),
-        highlighter,
     }
 }

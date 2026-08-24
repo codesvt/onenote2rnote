@@ -53,29 +53,29 @@ impl Manifest {
 pub fn fingerprint_page(page: &PageData) -> String {
     let mut h = Sha256::new();
     h.update(page.title.as_deref().unwrap_or("").as_bytes());
-    h.update(&page.updated_time.to_le_bytes());
-    h.update(&page.height_half_inch.unwrap_or(0.0).to_le_bytes());
+    h.update(page.updated_time.to_le_bytes());
+    h.update(page.height_half_inch.unwrap_or(0.0).to_le_bytes());
 
     for s in &page.strokes {
-        h.update(&s.width_ink.to_le_bytes());
-        h.update(&s.color.unwrap_or(0).to_le_bytes());
-        h.update(&[s.transparency.unwrap_or(0)]);
-        h.update(&s.off_half_inch.0.to_le_bytes());
-        h.update(&s.off_half_inch.1.to_le_bytes());
+        h.update(s.width_ink.to_le_bytes());
+        h.update(s.color.unwrap_or(0).to_le_bytes());
+        h.update([s.transparency.unwrap_or(0)]);
+        h.update(s.off_half_inch.0.to_le_bytes());
+        h.update(s.off_half_inch.1.to_le_bytes());
         for (x, y) in &s.points {
-            h.update(&x.to_le_bytes());
-            h.update(&y.to_le_bytes());
+            h.update(x.to_le_bytes());
+            h.update(y.to_le_bytes());
         }
     }
 
     for m in &page.media {
-        h.update(&[m.kind as u8]);
-        h.update(&m.x_half_inch.to_le_bytes());
-        h.update(&m.y_half_inch.to_le_bytes());
-        h.update(&m.width_half_inch.to_le_bytes());
-        h.update(&m.height_half_inch.to_le_bytes());
+        h.update([m.kind as u8]);
+        h.update(m.x_half_inch.to_le_bytes());
+        h.update(m.y_half_inch.to_le_bytes());
+        h.update(m.width_half_inch.to_le_bytes());
+        h.update(m.height_half_inch.to_le_bytes());
         h.update(m.filename.as_bytes());
-        h.update(&m.page_index.unwrap_or(0).to_le_bytes());
+        h.update(m.page_index.unwrap_or(0).to_le_bytes());
         h.update(&m.bytes);
     }
 

@@ -6,11 +6,7 @@ use std::process::{Command, Stdio};
 ///
 /// `page_index` is 0-based; pdftoppm expects a 1-based `-f`/`-l` range. The rendered PNG is
 /// returned as raw encoded bytes (not decoded).
-pub fn render_pdf_page(
-    pdf_bytes: &[u8],
-    page_index: u32,
-    dpi: u32,
-) -> anyhow::Result<Vec<u8>> {
+pub fn render_pdf_page(pdf_bytes: &[u8], page_index: u32, dpi: u32) -> anyhow::Result<Vec<u8>> {
     if which_pdftoppm().is_none() {
         anyhow::bail!(
             "`pdftoppm` was not found on your system.\n\
@@ -26,7 +22,7 @@ pub fn render_pdf_page(
     let png_path = base.with_extension("png");
     fs::write(&pdf_path, pdf_bytes).context("writing temporary PDF failed")?;
 
-    let page = (page_index + 1) as u32;
+    let page = page_index + 1;
     let child = Command::new("pdftoppm")
         .arg("-png")
         .arg("-f")
@@ -42,7 +38,9 @@ pub fn render_pdf_page(
         .spawn()
         .context("spawning pdftoppm failed")?;
 
-    let output = child.wait_with_output().context("waiting for pdftoppm failed")?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for pdftoppm failed")?;
     let _ = fs::remove_file(&pdf_path);
     if !output.status.success() {
         anyhow::bail!(
@@ -95,7 +93,9 @@ pub fn merge_pdfs(pdfs: &[&[u8]]) -> anyhow::Result<Vec<u8>> {
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning pdfunite failed")?;
-    let output = child.wait_with_output().context("waiting for pdfunite failed")?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for pdfunite failed")?;
     if !output.status.success() {
         anyhow::bail!(
             "pdfunite failed: {}",

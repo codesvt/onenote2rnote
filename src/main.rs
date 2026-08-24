@@ -1,5 +1,5 @@
 use clap::Parser;
-use onenote2rnote::manifest::{Manifest, fingerprint_page};
+use onenote2rnote::manifest::{fingerprint_page, Manifest};
 use onenote2rnote::onedata::{MediaKind, PageData};
 use onenote2rnote::rnote::{BackgroundKind, FormatKind, Options};
 use onenote2rnote::{manifest, onedata, rnote};
@@ -102,7 +102,12 @@ fn main() -> anyhow::Result<()> {
     if cli.list_pages || cli.verbose {
         let total: usize = pages.iter().map(|p| p.strokes.len()).sum();
         let total_media: usize = pages.iter().map(|p| p.media.len()).sum();
-        println!("parsed {} pages, {} strokes, {} media items total", pages.len(), total, total_media);
+        println!(
+            "parsed {} pages, {} strokes, {} media items total",
+            pages.len(),
+            total,
+            total_media
+        );
         for (i, page) in pages.iter().enumerate() {
             println!(
                 "  page {:3}: {:4} strokes, {:2} media  {:?}",
@@ -182,7 +187,10 @@ fn export_single_file(
     println!(
         "wrote {} ({} item(s) on {} page(s))",
         output.display(),
-        prepared.iter().map(|p| p.strokes.len() + p.images.len()).sum::<usize>(),
+        prepared
+            .iter()
+            .map(|p| p.strokes.len() + p.images.len())
+            .sum::<usize>(),
         n_pages
     );
     Ok(())
@@ -239,7 +247,11 @@ fn export_to_dir(
         // The per-page cache key must cover the output options: a change to `--rnote-version`,
         // `--dpi`, `--format`, `--margin`, … changes the produced bytes, so it must invalidate
         // previously exported pages instead of silently keeping stale output.
-        let fp = format!("{}|{}", fingerprint_options(options), fingerprint_page(page));
+        let fp = format!(
+            "{}|{}",
+            fingerprint_options(options),
+            fingerprint_page(page)
+        );
         let already = !force_reexport
             && manifest.pages.get(guid).map(|e| e.fingerprint.as_str()) == Some(fp.as_str());
 
@@ -265,10 +277,13 @@ fn export_to_dir(
             }
         }
         changed += 1;
-        new_entries.insert(guid.to_string(), manifest::PageEntry {
-            fingerprint: fp,
-            filenames: produced,
-        });
+        new_entries.insert(
+            guid.to_string(),
+            manifest::PageEntry {
+                fingerprint: fp,
+                filenames: produced,
+            },
+        );
     }
 
     // Orphaned pages: keep files unless --prune is set.
@@ -304,7 +319,12 @@ fn export_to_dir(
     Ok(())
 }
 
-fn export_page(page: &PageData, stem: &str, out_dir: &Path, options: &Options) -> anyhow::Result<Vec<String>> {
+fn export_page(
+    page: &PageData,
+    stem: &str,
+    out_dir: &Path,
+    options: &Options,
+) -> anyhow::Result<Vec<String>> {
     let prepared = rnote::prepare_page(page, options)?;
     let bytes = rnote::build_rnote_bytes_single(&prepared, options)?;
     let rnote_path = out_dir.join(format!("{stem}.rnote"));

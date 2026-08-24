@@ -81,7 +81,10 @@ pub fn parse_input(path: &Path) -> anyhow::Result<Vec<PageData>> {
         .file_name()
         .and_then(OsStr::to_str)
         .map(|n| n.to_ascii_lowercase());
-    let ext = path.extension().and_then(OsStr::to_str).map(str::to_lowercase);
+    let ext = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_lowercase);
 
     let kind = match (name_lower.as_deref(), ext.as_deref()) {
         (Some(n), _) if n.ends_with(".onepkg") => Some("onepkg"),
@@ -156,7 +159,9 @@ fn make_typed<'a>(s: &'a str) -> TypedPath<'a> {
 fn parse_section_with(path: &Path) -> anyhow::Result<Section> {
     let parser = Parser::new();
     let s = path.to_string_lossy();
-    parser.parse_section(make_typed(s.as_ref())).map_err(Into::into)
+    parser
+        .parse_section(make_typed(s.as_ref()))
+        .map_err(Into::into)
 }
 
 fn notebook_pages(notebook: &Notebook, out: &mut Vec<PageData>) {
@@ -346,10 +351,7 @@ fn stroke_data(stroke: &InkStroke, off: (f64, f64)) -> Option<InkStrokeData> {
     })
 }
 
-fn image_media(
-    image: &onenote_parser::contents::Image,
-    acc: (f64, f64),
-) -> Option<MediaData> {
+fn image_media(image: &onenote_parser::contents::Image, acc: (f64, f64)) -> Option<MediaData> {
     if image.data_status() != FileDataStatus::Available {
         return None;
     }
